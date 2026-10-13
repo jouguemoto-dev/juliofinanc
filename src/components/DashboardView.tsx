@@ -1,0 +1,960 @@
+import React, { useEffect, useState } from 'react';
+import { Account, Category, Transaction, CreditCard } from '../types';
+import { formatCurrency, formatSignedAmount, formatDateShortYear, MONTH_NAMES_PT } from '../utils/formatters';
+import { calculateAccountBalance } from '../utils/accounting';
+import { AddTransactionBar } from './AddTransactionBar';
+import { CreditCardsDashboardWidget } from './CreditCardsDashboardWidget';
+import { Plus, MessageSquare, Calendar, CheckCircle2, X } from 'lucide-react';
+
+type DashboardSections = {
+  entradas: boolean;
+  anteriores: boolean;
+  despesas: boolean;
+  proximas: boolean;
+  saldoContas: boolean;
+};
+
+const DEFAULT_DASHBOARD_SECTIONS: DashboardSections = {
+  entradas: true,
+  anteriores: false,
+  despesas: true,
+  proximas: false,
+  saldoContas: false,
+};
+
+function loadDashboardSections(): DashboardSections {
+  try {
+    const stored = localStorage.getItem('me_dashboard_sections_v1');
+    if (!stored) return DEFAULT_DASHBOARD_SECTIONS;
+    const parsed: unknown = JSON.parse(stored);
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+      return DEFAULT_DASHBOARD_SECTIONS;
+    }
+    const saved = parsed as Record<string, unknown>;
+    return {
+      entradas: typeof saved.entradas === 'boolean' ? saved.entradas : DEFAULT_DASHBOARD_SECTIONS.entradas,
+      anteriores: typeof saved.anteriores === 'boolean' ? saved.anteriores : DEFAULT_DASHBOARD_SECTIONS.anteriores,
+      despesas: typeof saved.despesas === 'boolean' ? saved.despesas : DEFAULT_DASHBOARD_SECTIONS.despesas,
+      proximas: typeof saved.proximas === 'boolean' ? saved.proximas : DEFAULT_DASHBOARD_SECTIONS.proximas,
+      saldoContas: typeof saved.saldoContas === 'boolean' ? saved.saldoContas : DEFAULT_DASHBOARD_SECTIONS.saldoContas,
+    };
+  } catch (error) {
+    console.error('Não foi possível carregar as preferências da tela inicial:', error);
+    return DEFAULT_DASHBOARD_SECTIONS;
+  }
+}
+
+interface DashboardViewProps {
+  transactions: Transaction[];
+  accounts: Account[];
+  categories: Category[];
+  creditCards?: CreditCard[];
+  selectedMonth: number;
+  selectedYear: number;
+  onPrevMonth: () => void;
+  onNextMonth: () => void;
+  onSelectMonthYear: (year: number, month: number) => void;
+  onAddTransaction: (
+    tx: Omit<Transaction, 'id'>,
+    count?: number,
+    options?: { isTotalAmount?: boolean }
+  ) => void;
+  onEditTransaction?: (tx: Transaction) => void;
+  onNavigateToTransactions: () => void;
+  onNavigateToAnalise?: (subType: 'categorias' | 'evolucao' | 'fluxo') => void;
+  onOpenInstallmentModal?: () => void;
+  onOpenChatModal?: () => void;
+  onOpenNewCardModal?: () => void;
+  onEditCard?: (card: CreditCard) => void;
+  onDeleteCard?: (cardId: string) => void;
+  showFirstRunGuide?: boolean;
+  hasConfiguredAccountInGuide?: boolean;
+  onOpenInitialAccount?: (account: Account) => void;
+  onOpenAccountSetup?: () => void;
+  onDismissFirstRunGuide?: () => void;
+  onPayCardInvoice: (
+    card: CreditCard,
+    amount: number,
+    sourceAccount: string,
+    invoiceClosingDate: string
+  ) => void;
+}
+
+export const DashboardView: React.FC<DashboardViewProps> = ({
+  transactions,
+  accounts,
+  categories,
+  creditCards = [],
+  selectedMonth,
+  selectedYear,
+  onPrevMonth,
+  onNextMonth,
+  onSelectMonthYear,
+  onAddTransaction,
+  onEditTransaction,
+  onNavigateToTransactions,
+  onNavigateToAnalise,
+  onOpenInstallmentModal,
+  onOpenChatModal,
+  onOpenNewCardModal,
+  onEditCard,
+  onDeleteCard,
+  showFirstRunGuide = false,
+  hasConfiguredAccountInGuide = false,
+  onOpenInitialAccount,
+  onOpenAccountSetup,
+  onDismissFirstRunGuide,
+  onPayCardInvoice,
+}) => {
+  const [showAddBar, setShowAddBar] = useState(false);
+  const [includePreviousBalance, setIncludePreviousBalance] = useState(true);
+  const [monthDropdownOpen, setMonthDropdownOpen] = useState(false);
+  const [hoveredChartIndex, setHoveredChartIndex] = useState<number | null>(null);
+  const [sections, setSections] = useState<DashboardSections>(loadDashboardSections);
+  const [guideAccountId, setGuideAccountId] = useState('');
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('me_dashboard_sections_v1', JSON.stringify(sections));
+    } catch (error) {
+      console.error('Não foi possível salvar as preferências da tela inicial:', error);
+    }
+  }, [sections]);
+
+  const toggleSection = (section: keyof DashboardSections) => {
+    setSections((previous) => ({ ...previous, [section]: !previous[section] }));
+  };
+
+  const now = new Date();
+  const currentRealMonth = now.getMonth();
+  const currentRealYear = now.getFullYear();
+  const isCurrentMonth = selectedMonth === currentRealMonth && selectedYear === currentRealYear;
+  const currentMonthLabel = `${MONTH_NAMES_PT[currentRealMonth]}/${currentRealYear}`;
+
+  const availableYears = Array.from(new Set([
+    selectedYear,
+    currentRealYear - 1,
+    currentRealYear,
+    currentRealYear + 1,
+  ])).sort((a, b) => a - b);
+
+  const monthLabel = `${MONTH_NAMES_PT[selectedMonth]}/${selectedYear}`;
+  const monthKey = `${selectedYear}-${String(selectedMonth + 1).padStart(2, '0')}`;
+  const realBalance = accounts.reduce(
+    (total, account) => total + calculateAccountBalance(account, transactions, false),
+    0
+  );
+  const projectedBalance = accounts.reduce(
+    (total, account) => total + calculateAccountBalance(account, transactions, true),
+    0
+  );
+
+  // Current month transactions (excluding internal transfers from pure income/expense categories)
+  const currentMonthTxs = transactions.filter(t => t.date.startsWith(monthKey));
+  const incomeTotal = currentMonthTxs
+    .filter(t => t.amount > 0 && t.type !== 'transferencia')
+    .reduce((acc, t) => acc + t.amount, 0);
+  const expenseTotal = currentMonthTxs
+    .filter(t => t.amount < 0 && t.type !== 'transferencia')
+    .reduce((acc, t) => acc + Math.abs(t.amount), 0);
+  
+  // Previous balance (from before this month)
+  const previousTxs = transactions.filter(t => t.date < `${monthKey}-01`);
+  const previousBalance = previousTxs.reduce((acc, t) => acc + t.amount, 0);
+
+  const netBalance = (includePreviousBalance ? previousBalance : 0) + incomeTotal - expenseTotal;
+
+  // Daily balance evolution for "Saldo das contas" chart
+  const daysInMonth = new Date(selectedYear, selectedMonth + 1, 0).getDate();
+  const startingBal = includePreviousBalance ? previousBalance : 0;
+  let runningBal = startingBal;
+  const dailyChartPoints: {
+    day: number;
+    dateStr: string;
+    balance: number;
+    dayNet: number;
+    dayIncome: number;
+    dayExpense: number;
+    hasActivity: boolean;
+  }[] = [];
+
+  for (let d = 1; d <= daysInMonth; d++) {
+    const dayStr = `${monthKey}-${String(d).padStart(2, '0')}`;
+    const dayTxs = currentMonthTxs.filter(t => t.date === dayStr);
+    const dayNet = dayTxs.reduce((acc, t) => acc + t.amount, 0);
+    const dayIncome = dayTxs.filter(t => t.amount > 0 && t.type !== 'transferencia').reduce((acc, t) => acc + t.amount, 0);
+    const dayExpense = dayTxs.filter(t => t.amount < 0 && t.type !== 'transferencia').reduce((acc, t) => acc + Math.abs(t.amount), 0);
+    runningBal += dayNet;
+    dailyChartPoints.push({
+      day: d,
+      dateStr: dayStr,
+      balance: runningBal,
+      dayNet,
+      dayIncome,
+      dayExpense,
+      hasActivity: dayTxs.length > 0,
+    });
+  }
+
+  const allBalances = dailyChartPoints.map(p => p.balance);
+  const minBal = Math.min(...allBalances, 0);
+  const maxBal = Math.max(...allBalances, 0);
+  const balSpan = maxBal - minBal || 100;
+
+  // Upcoming non-consolidated or next month transactions (from screenshots: November 2026)
+  const upcomingTxs = transactions
+    .filter(t => t.date > `${monthKey}-31` || (!t.isConsolidated && t.date >= `${monthKey}-01`))
+    .slice(0, 8);
+
+  // Past non-consolidated
+  const pastUnconsolidated = transactions.filter(t => t.date < `${monthKey}-01` && !t.isConsolidated);
+
+  // Category breakdown for current month
+  const expenseByCategory: Record<string, number> = {};
+  currentMonthTxs
+    .filter(t => t.amount < 0 && t.type !== 'transferencia')
+    .forEach(t => {
+      expenseByCategory[t.category] = (expenseByCategory[t.category] || 0) + Math.abs(t.amount);
+    });
+  const hasExpenses = Object.keys(expenseByCategory).length > 0;
+  const guideAccounts = accounts.filter((account) => account.type !== 'cartao');
+  const selectedGuideAccount =
+    guideAccounts.find((account) => account.id === guideAccountId) ?? guideAccounts[0];
+
+  return (
+    <div className="flex-1 bg-white min-w-0 text-[14.5px] font-sans select-none text-[#000000]">
+      {/* 1. TOP HEADER SUB-BAR */}
+      <div className="flex items-center justify-between pb-2 mb-3 border-b border-[#bbbbbb] flex-wrap gap-2">
+        {/* Date Selector & Add Button */}
+        <div className="flex items-center gap-2 flex-wrap">
+          <button
+            onClick={onPrevMonth}
+            className="w-7 h-7 flex items-center justify-center bg-[#f0f0f0] hover:bg-[#e4e4e4] border border-[#999] rounded-xs cursor-pointer text-[#000000] font-black text-[13px]"
+            title="Mês anterior"
+          >
+            ◀
+          </button>
+
+          {/* Month selector dropdown */}
+          <div className="relative">
+            <button
+              onClick={() => setMonthDropdownOpen(!monthDropdownOpen)}
+              className="flex items-center gap-2 px-3 sm:px-4 py-1.5 bg-[#fbfbfb] hover:bg-white border border-[#888888] font-black text-[14px] sm:text-[15px] text-[#000000] rounded-xs cursor-pointer"
+            >
+              <span>{monthLabel}</span>
+              <span className="text-[12px] text-green-700 font-black">▼</span>
+            </button>
+
+            {monthDropdownOpen && (
+              <div className="absolute top-full left-0 mt-1 w-56 bg-white border border-[#888888] shadow-xl py-1 z-30 max-h-60 overflow-y-auto">
+                {/* Shortcut to Current Month */}
+                <button
+                  type="button"
+                  onClick={() => {
+                    onSelectMonthYear(currentRealYear, currentRealMonth);
+                    setMonthDropdownOpen(false);
+                  }}
+                  className="w-full text-left px-3 py-2 text-xs font-black text-[#577708] bg-[#f1f6df] hover:bg-[#e4ecc4] border-b border-gray-200 flex items-center justify-between cursor-pointer"
+                >
+                  <span className="flex items-center gap-1.5">
+                    <Calendar className="w-3.5 h-3.5" />
+                    <span>Ir para Mês Atual</span>
+                  </span>
+                  <span className="text-[10px] bg-[#82af07] text-white px-1.5 py-0.5 rounded font-bold">
+                    {MONTH_NAMES_PT[currentRealMonth]}
+                  </span>
+                </button>
+
+                {availableYears.map(yr => (
+                  <div key={yr}>
+                    <div className="px-3 py-1 font-bold text-[12px] bg-gray-100 text-[#000000]">{yr}</div>
+                    {MONTH_NAMES_PT.map((m, idx) => (
+                      <button
+                        key={`${yr}-${idx}`}
+                        onClick={() => {
+                          onSelectMonthYear(yr, idx);
+                          setMonthDropdownOpen(false);
+                        }}
+                        className={`w-full text-left px-3.5 py-1.5 hover:bg-[#f1f6df] cursor-pointer text-[13.5px] font-bold ${
+                          selectedMonth === idx && selectedYear === yr ? 'text-[#73a000] font-black bg-green-50' : 'text-[#000000]'
+                        }`}
+                      >
+                        {m} / {yr}
+                      </button>
+                    ))}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          <button
+            onClick={onNextMonth}
+            className="w-7 h-7 flex items-center justify-center bg-[#f0f0f0] hover:bg-[#e4e4e4] border border-[#999] rounded-xs cursor-pointer text-[#000000] font-black text-[13px]"
+            title="Próximo mês"
+          >
+            ▶
+          </button>
+
+          {/* "+ Adicionar transação" Button */}
+          <button
+            type="button"
+            onClick={() => setShowAddBar(!showAddBar)}
+            className="flex items-center gap-1.5 bg-[#111111] hover:bg-[#000000] text-white px-3 sm:px-4 py-1.5 rounded-xs font-bold text-[13px] sm:text-[13.5px] cursor-pointer shadow-xs active:translate-y-px"
+          >
+            <Plus className="w-4 h-4 stroke-[3]" />
+            <span>Adicionar transação</span>
+          </button>
+
+          {/* "Lançar por chat" Button */}
+          {onOpenChatModal && (
+            <button
+              type="button"
+              onClick={onOpenChatModal}
+              className="flex items-center gap-1.5 px-3 sm:px-3.5 py-1.5 border border-[#999] bg-gradient-to-b from-[#ffffff] to-[#e4e4e4] hover:to-[#dadada] text-[#000000] font-black rounded-xs text-[13px] cursor-pointer active:translate-y-px shadow-xs"
+              title="Criar lançamento por chat com Inteligência Artificial"
+            >
+              <MessageSquare className="w-4 h-4 text-[#5a8710]" />
+              <span>Lançar por chat</span>
+            </button>
+          )}
+        </div>
+
+        {/* Date & Last access display on right (clean on desktop, hidden on tiny mobile to save space) */}
+        <div className="hidden sm:block text-right">
+          <div className="font-black text-[13.5px] text-[#000000]">
+            {new Date().toLocaleDateString('pt-BR', { weekday: 'long', day: '2-digit', month: '2-digit', year: 'numeric' })}
+          </div>
+          <div className="text-[11.5px] font-semibold text-[#555555]">
+            Minhas Economias Web
+          </div>
+        </div>
+      </div>
+
+      {showFirstRunGuide && (
+        <section className="mb-3 rounded-lg border border-emerald-200 bg-emerald-50 p-3.5 sm:p-4" aria-labelledby="first-run-title">
+          <div className="flex items-start justify-between gap-3">
+            <div>
+              <h2 id="first-run-title" className="text-[15px] font-black text-emerald-950">
+                Vamos organizar suas finanças
+              </h2>
+              <p className="mt-0.5 text-xs font-medium text-emerald-900">
+                Cadastre uma conta, informe o saldo inicial e registre sua primeira despesa.
+              </p>
+            </div>
+            {onDismissFirstRunGuide && (
+              <button
+                type="button"
+                onClick={onDismissFirstRunGuide}
+                className="rounded p-1 text-emerald-900 hover:bg-emerald-100"
+                aria-label="Ocultar roteiro inicial"
+                title="Ocultar roteiro inicial"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            )}
+          </div>
+          <div className="mt-3 grid gap-2 sm:grid-cols-2">
+            <div className="rounded-md border border-emerald-100 bg-white p-3">
+              <div className="flex items-center gap-2">
+                <CheckCircle2 className={`h-4 w-4 ${hasConfiguredAccountInGuide ? 'text-emerald-700' : 'text-slate-300'}`} />
+                <span className="text-xs font-black text-slate-900">1. Configure uma conta e seu saldo inicial</span>
+              </div>
+              <p className="ml-6 mt-1 text-[11px] leading-relaxed text-slate-600">
+                Use o saldo que aparece no banco hoje. Depois registre apenas movimentações futuras para não contar despesas antigas duas vezes.
+              </p>
+              <div className="ml-6 mt-2 flex flex-wrap items-center gap-2">
+                {guideAccounts.length > 0 && (
+                  <select
+                    value={selectedGuideAccount?.id ?? ''}
+                    onChange={(event) => setGuideAccountId(event.target.value)}
+                    aria-label="Conta para configurar o saldo inicial"
+                    className="max-w-full rounded border border-slate-300 bg-white px-2 py-1 text-xs font-semibold text-slate-800"
+                  >
+                    {guideAccounts.map((account) => (
+                      <option key={account.id} value={account.id}>{account.name}</option>
+                    ))}
+                  </select>
+                )}
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (selectedGuideAccount) onOpenInitialAccount?.(selectedGuideAccount);
+                    else onOpenAccountSetup?.();
+                  }}
+                  className="rounded bg-[#5a8710] px-2.5 py-1.5 text-xs font-black text-white hover:bg-[#4d740c]"
+                >
+                  {selectedGuideAccount ? 'Ajustar saldo' : 'Cadastrar conta'}
+                </button>
+              </div>
+            </div>
+            <div className="rounded-md border border-emerald-100 bg-white p-3">
+              <div className="flex items-center gap-2">
+                <CheckCircle2 className={`h-4 w-4 ${transactions.length > 0 ? 'text-emerald-700' : 'text-slate-300'}`} />
+                <span className="text-xs font-black text-slate-900">2. Registre sua primeira despesa</span>
+              </div>
+              <p className="ml-6 mt-1 text-[11px] leading-relaxed text-slate-600">
+                Informe descrição, valor, data e conta para acompanhar o saldo real e o previsto.
+              </p>
+              <button
+                type="button"
+                onClick={() => setShowAddBar(true)}
+                className="ml-6 mt-2 rounded border border-slate-300 bg-white px-2.5 py-1.5 text-xs font-black text-slate-800 hover:bg-slate-50"
+              >
+                <Plus className="mr-1 inline h-3.5 w-3.5" />
+                Lançar primeira despesa
+              </button>
+            </div>
+          </div>
+        </section>
+      )}
+
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-3">
+        <div className="border border-emerald-200 bg-emerald-50 px-3.5 py-2.5 rounded-xs">
+          <span className="block text-[11px] uppercase font-black tracking-wide text-emerald-800">Saldo real</span>
+          <strong className="text-lg font-black tabular-nums text-emerald-900">{formatCurrency(realBalance)}</strong>
+          <span className="block text-[10.5px] font-semibold text-emerald-800">Somente lançamentos liquidados</span>
+        </div>
+        <div className="border border-blue-200 bg-blue-50 px-3.5 py-2.5 rounded-xs">
+          <span className="block text-[11px] uppercase font-black tracking-wide text-blue-800">Saldo previsto</span>
+          <strong className="text-lg font-black tabular-nums text-blue-900">{formatCurrency(projectedBalance)}</strong>
+          <span className="block text-[10.5px] font-semibold text-blue-800">Inclui todos os lançamentos pendentes</span>
+        </div>
+      </div>
+
+      {/* Inline Add Bar if open */}
+      {showAddBar && (
+        <AddTransactionBar
+          accounts={accounts}
+          categories={categories}
+          currentDateStr={(() => {
+            const now = new Date();
+            const day = now.getFullYear() === selectedYear && now.getMonth() === selectedMonth
+              ? String(now.getDate()).padStart(2, '0')
+              : '01';
+            return `${selectedYear}-${String(selectedMonth + 1).padStart(2, '0')}-${day}`;
+          })()}
+          onSave={(newTx, count, options) => {
+            onAddTransaction(newTx, count, options);
+            setShowAddBar(false);
+          }}
+          onCancel={() => setShowAddBar(false)}
+        />
+      )}
+
+      {/* 2. MAIN WIDGETS GRID (Exact layout from Image 1) */}
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        {/* ROW 1 - LEFT: ENTRADAS E SAÍDAS */}
+        <div className="bg-white border border-[#b8b8b8] shadow-xs">
+          <div className="bg-[#eeeeee] border-b border-[#cccccc] px-3 py-2 flex items-center justify-between">
+            <span className="font-black text-[14.5px] text-[#000000]">Entradas e saídas</span>
+            <div className="flex items-center gap-1.5 text-[#000000]">
+              <button
+                onClick={() => toggleSection('entradas')}
+                aria-expanded={sections.entradas}
+                aria-label={sections.entradas ? 'Recolher entradas e saídas' : 'Expandir entradas e saídas'}
+                className="w-5 h-5 flex items-center justify-center border border-[#999] bg-[#ffffff] hover:bg-gray-200 text-[12px] font-black cursor-pointer"
+              >
+                {sections.entradas ? '-' : '+'}
+              </button>
+              <span
+                className="w-5 h-5 flex items-center justify-center border border-[#999] bg-[#ffffff] text-[12px] font-bold cursor-help select-none"
+                title="Resumo mensal de todas as entradas e saídas e saldo acumulado."
+              >
+                ?
+              </span>
+            </div>
+          </div>
+
+          {sections.entradas && (
+            <div className="p-4 space-y-3">
+              <label className="flex items-center gap-2 cursor-pointer text-[#000000] font-bold text-[14px]">
+                <input
+                  type="checkbox"
+                  checked={includePreviousBalance}
+                  onChange={(e) => setIncludePreviousBalance(e.target.checked)}
+                  className="w-4 h-4 accent-[#0078d7] cursor-pointer"
+                />
+                <span>Incluir saldo anterior</span>
+              </label>
+
+              <div className="space-y-2 pt-1 text-[14.5px]">
+                <div className="flex items-center justify-between text-[#000000] font-bold">
+                  <span>Saldo anterior</span>
+                  <span className="tabular-nums font-black text-[#000000]">{formatCurrency(previousBalance)}</span>
+                </div>
+                <div className="flex items-center justify-between text-[#000000] font-bold">
+                  <span>Entradas</span>
+                  <span className="tabular-nums font-black text-[#15803d]">{formatCurrency(incomeTotal)}</span>
+                </div>
+                <div className="flex items-center justify-between text-[#000000] font-bold">
+                  <span>Saídas</span>
+                  <span className="tabular-nums font-black text-[#dc2626]">{formatCurrency(expenseTotal)}</span>
+                </div>
+              </div>
+
+              {/* Separator line */}
+              <div className="border-t-2 border-[#b8b8b8] pt-3 flex justify-end">
+                <div className="font-black text-[34px] text-[#000000] leading-none tabular-nums">
+                  {formatCurrency(netBalance)}
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* ROW 1 - RIGHT: ANTERIORES NÃO CONSOLIDADAS */}
+        <div className="bg-white border border-[#b8b8b8] shadow-xs">
+          <div className="bg-[#eeeeee] border-b border-[#cccccc] px-3 py-2 flex items-center justify-between">
+            <span className="font-black text-[14.5px] text-[#000000]">Anteriores não consolidadas</span>
+            <div className="flex items-center gap-1.5 text-[#000000]">
+              <button
+                onClick={() => toggleSection('anteriores')}
+                aria-expanded={sections.anteriores}
+                aria-label={sections.anteriores ? 'Recolher lançamentos anteriores' : 'Expandir lançamentos anteriores'}
+                className="w-5 h-5 flex items-center justify-center border border-[#999] bg-[#ffffff] hover:bg-gray-200 text-[12px] font-black cursor-pointer"
+              >
+                {sections.anteriores ? '-' : '+'}
+              </button>
+              <span
+                className="w-5 h-5 flex items-center justify-center border border-[#999] bg-[#ffffff] text-[12px] font-bold cursor-help select-none"
+                title="Transações de períodos anteriores ainda pendentes de consolidação."
+              >
+                ?
+              </span>
+            </div>
+          </div>
+
+          {sections.anteriores && (
+            <div className="p-3.5 min-h-[140px] flex flex-col justify-between">
+              <div className="flex items-center justify-between text-[#000000] font-black border-b border-[#bbbbbb] pb-1.5 text-[13.5px]">
+                <span className="w-1/2">Transações</span>
+                <span className="w-1/4 text-center">Data</span>
+                <span className="w-1/4 text-right">Valor (R$)</span>
+              </div>
+
+              {pastUnconsolidated.length === 0 ? (
+                <div className="py-5 text-center text-[13px] font-semibold text-slate-600">
+                  Não há lançamentos antigos pendentes de confirmação.
+                  <button
+                    type="button"
+                    onClick={onNavigateToTransactions}
+                    className="mt-1 block w-full font-black text-[#5a8710] hover:underline"
+                  >
+                    Abrir transações
+                  </button>
+                </div>
+              ) : (
+                <div className="space-y-1.5 py-1">
+                  {pastUnconsolidated.map((tx) => (
+                    <div key={tx.id} className="flex items-center justify-between py-1 text-[13.5px] font-bold text-[#000000]">
+                      <span className="w-1/2 truncate">{tx.description}</span>
+                      <span className="w-1/4 text-center text-[#000000] font-semibold">{formatDateShortYear(tx.date)}</span>
+                      <span className="w-1/4 text-right tabular-nums font-black">{formatSignedAmount(tx.amount)}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+              <div />
+            </div>
+          )}
+        </div>
+
+        {/* ROW 1.5 - FULL WIDTH: CARTÕES DE CRÉDITO, FATURAS & COMPRAS PARCELADAS (QUANDO VAI ACABAR) */}
+        <CreditCardsDashboardWidget
+          cards={creditCards}
+          transactions={transactions}
+          accounts={accounts}
+          onOpenNewCardModal={onOpenNewCardModal || (() => {})}
+          onEditCard={onEditCard || (() => {})}
+          onDeleteCard={onDeleteCard}
+          onPayCardInvoice={onPayCardInvoice}
+          onOpenInstallmentModal={onOpenInstallmentModal}
+          onAddTransactionToCard={(cardName) => {
+            setShowAddBar(true);
+          }}
+        />
+
+        {/* ROW 2 - LEFT: DESPESAS */}
+        <div className="bg-white border border-[#b8b8b8] shadow-xs">
+          <div className="bg-[#eeeeee] border-b border-[#cccccc] px-3 py-2 flex items-center justify-between">
+            <span className="font-black text-[14.5px] text-[#000000]">Despesas</span>
+            <div className="flex items-center gap-1.5 text-[#000000]">
+              <button
+                onClick={() => toggleSection('despesas')}
+                aria-expanded={sections.despesas}
+                aria-label={sections.despesas ? 'Recolher despesas' : 'Expandir despesas'}
+                className="w-5 h-5 flex items-center justify-center border border-[#999] bg-[#ffffff] hover:bg-gray-200 text-[12px] font-black cursor-pointer"
+              >
+                {sections.despesas ? '-' : '+'}
+              </button>
+              <button
+                className="w-5 h-5 flex items-center justify-center border border-[#999] bg-[#ffffff] hover:bg-gray-200 text-[12px] font-bold cursor-pointer"
+                title="Maximizar relatório de despesas"
+                onClick={onNavigateToAnalise ? () => onNavigateToAnalise('categorias') : onNavigateToTransactions}
+              >
+                ⤢
+              </button>
+              <button
+                className="w-5 h-5 flex items-center justify-center border border-[#999] bg-[#ffffff] hover:bg-gray-200 text-[12px] font-bold cursor-pointer"
+              >
+                ?
+              </button>
+            </div>
+          </div>
+
+          {sections.despesas && (
+            <div className="p-3.5 min-h-[160px] flex flex-col justify-between">
+              <div className="text-[#000000] text-[13.5px] font-bold mb-2">Todas as Categorias</div>
+
+              {!hasExpenses ? (
+                <div className="py-6 text-center text-[13px] font-medium text-slate-600">
+                  As despesas deste período aparecerão aqui quando você lançar uma transação.
+                  <button
+                    type="button"
+                    onClick={() => setShowAddBar(true)}
+                    className="mt-2 block w-full font-black text-[#5a8710] hover:underline"
+                  >
+                    Adicionar despesa
+                  </button>
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  {Object.entries(expenseByCategory).slice(0, 5).map(([cat, amount]) => (
+                    <div key={cat} className="space-y-1">
+                      <div className="flex justify-between text-[13.5px] font-bold">
+                        <span className="text-[#000000]">{cat}</span>
+                        <span className="font-black text-red-700 tabular-nums">{formatCurrency(amount)}</span>
+                      </div>
+                      <div className="w-full bg-gray-200 h-2.5 rounded-full overflow-hidden">
+                        <div
+                          className="bg-[#82af07] h-full"
+                          style={{ width: `${Math.min(100, (amount / expenseTotal) * 100)}%` }}
+                        />
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+              <div />
+            </div>
+          )}
+        </div>
+
+        {/* ROW 2 - RIGHT: PRÓXIMAS NÃO CONSOLIDADAS */}
+        <div className="bg-white border border-[#b8b8b8] shadow-xs">
+          <div className="bg-[#eeeeee] border-b border-[#cccccc] px-3 py-2 flex items-center justify-between">
+            <span className="font-black text-[14.5px] text-[#000000]">Próximas não consolidadas</span>
+            <div className="flex items-center gap-1.5 text-[#000000]">
+              <button
+                onClick={() => toggleSection('proximas')}
+                aria-expanded={sections.proximas}
+                aria-label={sections.proximas ? 'Recolher próximos lançamentos' : 'Expandir próximos lançamentos'}
+                className="w-5 h-5 flex items-center justify-center border border-[#999] bg-[#ffffff] hover:bg-gray-200 text-[12px] font-black cursor-pointer"
+              >
+                {sections.proximas ? '-' : '+'}
+              </button>
+              <button
+                className="w-5 h-5 flex items-center justify-center border border-[#999] bg-[#ffffff] hover:bg-gray-200 text-[12px] font-bold cursor-pointer"
+              >
+                ?
+              </button>
+            </div>
+          </div>
+
+          {sections.proximas && (
+            <div className="p-3.5 space-y-2">
+              <div className="flex items-center justify-between text-[#000000] font-black border-b border-[#bbbbbb] pb-1.5 text-[13px]">
+                <span className="w-[48%]">Transações</span>
+                <span className="w-[24%] text-center">Data</span>
+                <span className="w-[28%] text-right pr-6">Valor (R$)</span>
+              </div>
+
+              {upcomingTxs.length === 0 ? (
+                <div className="py-5 text-center text-[13px] font-medium text-slate-600">
+                  Nenhum lançamento futuro ou pendente para mostrar.
+                  <button
+                    type="button"
+                    onClick={() => setShowAddBar(true)}
+                    className="mt-1 block w-full font-black text-[#5a8710] hover:underline"
+                  >
+                    Planejar um lançamento
+                  </button>
+                </div>
+              ) : (
+                <div className="space-y-1 text-[13.5px]">
+                  {upcomingTxs.map((tx) => {
+                    const isNeg = tx.amount < 0;
+                    return (
+                      <div
+                        key={tx.id}
+                        className="flex items-center justify-between py-1 hover:bg-gray-100 group border-b border-gray-100 last:border-b-0"
+                      >
+                        <div className="w-[48%] flex items-center gap-1.5 truncate text-[#000000] font-bold">
+                          {tx.isRecurring && (
+                            <span className="text-black text-[12px]">🕒</span>
+                          )}
+                          <span className="truncate">{tx.description}</span>
+                        </div>
+
+                        <div className="w-[24%] text-center text-[#000000] font-bold text-[13px]">
+                          {formatDateShortYear(tx.date)}
+                        </div>
+
+                        <div className="w-[28%] flex items-center justify-end gap-2 tabular-nums">
+                          <span className={isNeg ? 'text-[#dc2626] font-black text-[14px]' : 'text-[#15803d] font-black text-[14px]'}>
+                            {formatSignedAmount(tx.amount)}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              if (onEditTransaction) {
+                                onEditTransaction(tx);
+                              } else {
+                                onNavigateToTransactions();
+                              }
+                            }}
+                            className="text-black hover:text-green-700 cursor-pointer p-0.5 text-[13px] font-bold"
+                            title="Editar transação"
+                          >
+                            ✎
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+
+        {/* ROW 3 - LEFT: SALDO DAS CONTAS (Interactive SVG Line Chart) */}
+        <div className="bg-white border border-[#b8b8b8] shadow-xs">
+          <div className="bg-[#eeeeee] border-b border-[#cccccc] px-3 py-2 flex items-center justify-between">
+            <span className="font-black text-[14.5px] text-[#000000]">Saldo das contas</span>
+            <div className="flex items-center gap-1.5 text-[#000000]">
+              <button
+                onClick={() => toggleSection('saldoContas')}
+                aria-expanded={sections.saldoContas}
+                aria-label={sections.saldoContas ? 'Recolher gráfico do saldo' : 'Expandir gráfico do saldo'}
+                className="w-5 h-5 flex items-center justify-center border border-[#999] bg-[#ffffff] hover:bg-gray-200 text-[12px] font-black cursor-pointer"
+              >
+                {sections.saldoContas ? '-' : '+'}
+              </button>
+              <button
+                className="w-5 h-5 flex items-center justify-center border border-[#999] bg-[#ffffff] hover:bg-gray-200 text-[12px] font-bold cursor-pointer"
+                title="Expandir relatório de evolução do saldo"
+                onClick={onNavigateToAnalise ? () => onNavigateToAnalise('evolucao') : onNavigateToTransactions}
+              >
+                ⤢
+              </button>
+              <span
+                className="w-5 h-5 flex items-center justify-center border border-[#999] bg-[#ffffff] text-[12px] font-bold cursor-help select-none"
+                title="Gráfico da evolução diária do saldo acumulado ao longo do mês."
+              >
+                ?
+              </span>
+            </div>
+          </div>
+
+          {sections.saldoContas && (
+            <div className="p-3.5 space-y-2">
+              <div className="flex items-center justify-between text-[12px] font-bold text-[#555555]">
+                <span>Mês: {monthLabel}</span>
+                <span className="text-black font-black">
+                  Saldo Final: {formatCurrency(runningBal)}
+                </span>
+              </div>
+
+              {/* Chart container with Y-axis gutter */}
+              <div className="relative pl-16 pr-2 pt-2 pb-6">
+                {/* Y-axis markings */}
+                <div className="absolute left-0 top-1 text-[10.5px] text-[#000000] font-black tabular-nums text-right w-14">
+                  {formatCurrency(maxBal)}
+                </div>
+                <div className="absolute left-0 top-1/2 -translate-y-1/2 text-[10.5px] text-[#666666] font-bold tabular-nums text-right w-14">
+                  {formatCurrency((maxBal + minBal) / 2)}
+                </div>
+                <div className="absolute left-0 bottom-6 text-[10.5px] text-[#000000] font-black tabular-nums text-right w-14">
+                  {formatCurrency(minBal)}
+                </div>
+
+                {/* SVG Chart Area */}
+                <div className="relative h-44 w-full border-l-2 border-b-2 border-[#555555] bg-white">
+                  {(() => {
+                    const svgW = 500;
+                    const svgH = 176;
+                    const coords = dailyChartPoints.map((pt, idx) => {
+                      const x = (idx / (daysInMonth - 1)) * svgW;
+                      const y = svgH - 12 - ((pt.balance - minBal) / balSpan) * (svgH - 24);
+                      return { ...pt, x, y };
+                    });
+
+                    const pathLine = coords.reduce(
+                      (acc, p, idx) => (idx === 0 ? `M ${p.x} ${p.y}` : `${acc} L ${p.x} ${p.y}`),
+                      ''
+                    );
+                    const pathArea = `${pathLine} L ${coords[coords.length - 1].x} ${svgH} L ${coords[0].x} ${svgH} Z`;
+
+                    // Zero baseline position if 0 is between min and max
+                    const yZero = minBal < 0 && maxBal > 0
+                      ? svgH - 12 - ((0 - minBal) / balSpan) * (svgH - 24)
+                      : null;
+
+                    const activeHoverPoint = hoveredChartIndex !== null ? coords[hoveredChartIndex] : null;
+
+                    return (
+                      <>
+                        <svg
+                          viewBox={`0 0 ${svgW} ${svgH}`}
+                          className="w-full h-full overflow-visible cursor-crosshair"
+                          preserveAspectRatio="none"
+                          onMouseLeave={() => setHoveredChartIndex(null)}
+                          onMouseMove={(e) => {
+                            const rect = e.currentTarget.getBoundingClientRect();
+                            const mouseX = e.clientX - rect.left;
+                            const frac = Math.max(0, Math.min(1, mouseX / rect.width));
+                            const closestIdx = Math.round(frac * (daysInMonth - 1));
+                            setHoveredChartIndex(closestIdx);
+                          }}
+                        >
+                          <defs>
+                            <linearGradient id="dashboardBalanceGrad" x1="0" y1="0" x2="0" y2="1">
+                              <stop offset="0%" stopColor="#00b4a6" stopOpacity="0.30" />
+                              <stop offset="100%" stopColor="#00b4a6" stopOpacity="0.0" />
+                            </linearGradient>
+                          </defs>
+
+                          {/* Day Grid Lines */}
+                          {coords
+                            .filter((_, idx) => (idx + 1) % 5 === 0 || idx === 0 || idx === daysInMonth - 1)
+                            .map((p, idx) => (
+                              <line
+                                key={idx}
+                                x1={p.x}
+                                y1="0"
+                                x2={p.x}
+                                y2={svgH}
+                                stroke="#f0f0f0"
+                                strokeWidth="1"
+                              />
+                            ))}
+
+                          {/* Horizontal Mid Grid Line */}
+                          <line x1="0" y1={svgH / 2} x2={svgW} y2={svgH / 2} stroke="#f0f0f0" strokeWidth="1" />
+
+                          {/* Zero line if balance crosses zero */}
+                          {yZero !== null && (
+                            <line
+                              x1="0"
+                              y1={yZero}
+                              x2={svgW}
+                              y2={yZero}
+                              stroke="#ef4444"
+                              strokeWidth="1"
+                              strokeDasharray="4 3"
+                            />
+                          )}
+
+                          {/* Area Fill */}
+                          <path d={pathArea} fill="url(#dashboardBalanceGrad)" />
+
+                          {/* The teal line tracking balance evolution */}
+                          <path
+                            d={pathLine}
+                            stroke="#00b4a6"
+                            strokeWidth="3"
+                            fill="none"
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                          />
+
+                          {/* Points with activity */}
+                          {coords.map((p, idx) => {
+                            if (!p.hasActivity && idx !== 0 && idx !== daysInMonth - 1) return null;
+                            return (
+                              <circle
+                                key={idx}
+                                cx={p.x}
+                                cy={p.y}
+                                r={p.hasActivity ? 4 : 2.5}
+                                fill={p.hasActivity ? '#ffffff' : '#00b4a6'}
+                                stroke="#00b4a6"
+                                strokeWidth="2"
+                              />
+                            );
+                          })}
+
+                          {/* Hover Crosshair Marker */}
+                          {activeHoverPoint && (
+                            <g>
+                              <line
+                                x1={activeHoverPoint.x}
+                                y1="0"
+                                x2={activeHoverPoint.x}
+                                y2={svgH}
+                                stroke="#111111"
+                                strokeWidth="1.5"
+                                strokeDasharray="3 3"
+                              />
+                              <circle
+                                cx={activeHoverPoint.x}
+                                cy={activeHoverPoint.y}
+                                r="6"
+                                fill="#111111"
+                                stroke="#ffffff"
+                                strokeWidth="2.5"
+                              />
+                            </g>
+                          )}
+                        </svg>
+
+                        {/* Hover Tooltip Popup */}
+                        {activeHoverPoint && (
+                          <div
+                            className="absolute -top-12 z-20 pointer-events-none bg-black/90 text-white text-[11px] px-2.5 py-1.5 rounded shadow-xl whitespace-nowrap transform -translate-x-1/2"
+                            style={{
+                              left: `${(activeHoverPoint.day - 1) / (daysInMonth - 1) * 100}%`,
+                            }}
+                          >
+                            <div className="font-black text-amber-300">
+                              Dia {activeHoverPoint.day} ({formatDateShortYear(activeHoverPoint.dateStr)})
+                            </div>
+                            <div className="font-bold">
+                              Saldo: <span className="tabular-nums font-black text-white">{formatCurrency(activeHoverPoint.balance)}</span>
+                            </div>
+                            {activeHoverPoint.hasActivity ? (
+                              <div className="text-[10px] text-gray-200">
+                                Movimentações: {activeHoverPoint.dayIncome > 0 && <span className="text-green-400 font-bold">+{formatCurrency(activeHoverPoint.dayIncome)} </span>}
+                                {activeHoverPoint.dayExpense > 0 && <span className="text-red-400 font-bold">-{formatCurrency(activeHoverPoint.dayExpense)}</span>}
+                              </div>
+                            ) : (
+                              <div className="text-[10px] text-gray-400">Sem lançamentos neste dia</div>
+                            )}
+                          </div>
+                        )}
+                      </>
+                    );
+                  })()}
+                </div>
+
+                {/* X-axis Day Markings */}
+                <div className="flex justify-between text-[10px] text-[#555555] font-black pt-1">
+                  <span>Dia 1</span>
+                  <span>5</span>
+                  <span>10</span>
+                  <span>15</span>
+                  <span>20</span>
+                  <span>25</span>
+                  <span>{daysInMonth}</span>
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+
+      </div>
+    </div>
+  );
+};

@@ -1,0 +1,17 @@
+node_modules/
+build/
+dist/
+dev-dist/
+coverage/
+data/*.sqlite
+data/*.sqlite-shm
+data/*.sqlite-wal
+data/store.json
+.DS_Store
+*.log
+.env*
+!.env.example
+.firebase/
+firebase-debug.log
+*-service-account*.json
+service-account*.json
